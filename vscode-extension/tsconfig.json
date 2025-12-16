@@ -8,7 +8,9 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "sourceMap": true
+    "sourceMap": true,
+    "inlineSourceMap": false,
+    "inlineSources": false
   },
   "include": [
     "src"
@@ -16,5 +18,12 @@
   "exclude": [
     "node_modules",
     "dist"
-  ]
-} 
+  ],
+  "watchOptions": {
+    "watchFile": "useFsEvents",
+    "watchDirectory": "useFsEvents",
+    "fallbackPolling": "dynamicPriority",
+    "synchronousWatchDirectory": true,
+    "excludeDirectories": ["**/node_modules", "**/dist"]
+  }
+}

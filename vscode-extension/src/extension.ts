@@ -7,7 +7,7 @@ interface SyncState {
     column: number;
     source: 'vscode' | 'jetbrains';
     isActive: boolean;
-    action?: 'close';  // Add action field for document close events
+    action: 'close' | 'select';  // Add action field for document close events
 }
 
 class Logger {
@@ -185,6 +185,34 @@ export class VSCodeJetBrainsSync {
     }
 
     private setupEditorListeners() {
+        // Listen for tab close events (more precise than onDidCloseTextDocument, which may not fire
+        // when a document is still open in another editor group).
+        this.disposables.push(
+            vscode.window.tabGroups.onDidChangeTabs((e) => {
+                if (this.isHandlingExternalUpdate) {
+                    return;
+                }
+
+                for (const tab of e.closed) {
+                    const tabInput = tab.input as unknown as { uri?: vscode.Uri };
+                    const uri = tabInput?.uri;
+                    if (!uri || uri.scheme !== 'file') {
+                        continue;
+                    }
+
+                    this.logger.info(`Tab closed in VSCode: ${uri.fsPath}`);
+                    this.updateState({
+                        filePath: uri.fsPath,
+                        line: 0,
+                        column: 0,
+                        source: 'vscode',
+                        isActive: this.isActive,
+                        action: 'close'
+                    });
+                }
+            })
+        );
+
         // Listen for active editor changes
         this.disposables.push(
             vscode.window.onDidChangeActiveTextEditor((editor) => {
@@ -196,7 +224,8 @@ export class VSCodeJetBrainsSync {
                         line: position.line,
                         column: position.character,
                         source: 'vscode',
-                        isActive: this.isActive
+                        isActive: this.isActive,
+                        action: 'select'
                     });
                 }
             })
@@ -206,7 +235,7 @@ export class VSCodeJetBrainsSync {
         this.disposables.push(
             vscode.workspace.onDidCloseTextDocument((document) => {
                 if (!this.isHandlingExternalUpdate) {
-                    this.logger.debug(`Document closed: ${document.uri.fsPath}`);
+                    this.logger.info(`Document closed in VSCode: ${document.uri.fsPath}`);
                     this.updateState({
                         filePath: document.uri.fsPath,
                         line: 0,
@@ -230,7 +259,8 @@ export class VSCodeJetBrainsSync {
                         line: position.line,
                         column: position.character,
                         source: 'vscode',
-                        isActive: this.isActive
+                        isActive: this.isActive,
+                        action: 'select'
                     });
                 }
             })
@@ -260,6 +290,76 @@ export class VSCodeJetBrainsSync {
             return; // Ignore our own updates
         }
 
+        // Always handle close events, regardless of active state
+        if (state.action === 'close') {
+            try {
+                this.isHandlingExternalUpdate = true;
+                this.logger.info(`Received close event for file: ${state.filePath}`);
+                
+                // Try to find the document using URI comparison
+                const targetUri = vscode.Uri.file(state.filePath);
+                const documents = vscode.workspace.textDocuments;
+                const visibleEditors = vscode.window.visibleTextEditors;
+                
+                this.logger.debug(`Open documents count: ${documents.length}, Visible editors: ${visibleEditors.length}`);
+                
+                // First try to find in textDocuments
+                let editorToClose = documents.find(doc => {
+                    const matches = doc.uri.fsPath === targetUri.fsPath || 
+                                   doc.uri.toString() === targetUri.toString() ||
+                                   doc.uri.fsPath.toLowerCase() === targetUri.fsPath.toLowerCase();
+                    return matches;
+                });
+                
+                // If not found, try to find in visible editors
+                if (!editorToClose) {
+                    const matchingEditor = visibleEditors.find(editor => {
+                        const matches = editor.document.uri.fsPath === targetUri.fsPath ||
+                                       editor.document.uri.fsPath.toLowerCase() === targetUri.fsPath.toLowerCase();
+                        return matches;
+                    });
+                    if (matchingEditor) {
+                        editorToClose = matchingEditor.document;
+                    }
+                }
+                
+                if (editorToClose) {
+                    this.logger.info(`Closing document in VSCode: ${editorToClose.uri.fsPath}`);
+                    
+                    // Use tabGroups API to close the tab without activating it
+                    let tabClosed = false;
+                    for (const tabGroup of vscode.window.tabGroups.all) {
+                        const tab = tabGroup.tabs.find(t => {
+                            const tabInput = t.input as any;
+                            return tabInput?.uri?.fsPath === editorToClose.uri.fsPath ||
+                                   tabInput?.uri?.fsPath?.toLowerCase() === editorToClose.uri.fsPath.toLowerCase();
+                        });
+                        
+                        if (tab) {
+                            this.logger.debug(`Found tab in group ${tabGroup.viewColumn}, closing without activation`);
+                            await vscode.window.tabGroups.close(tab);
+                            tabClosed = true;
+                            break;
+                        }
+                    }
+                    
+                    if (!tabClosed) {
+                        this.logger.warn(`Tab not found in tabGroups for: ${editorToClose.uri.fsPath}`);
+                    }
+                } else {
+                    // Log all open documents for debugging
+                    const openPaths = documents.map(d => d.uri.fsPath).join('\n  ');
+                    this.logger.warn(`Document not found. Looking for: ${targetUri.fsPath}`);
+                    this.logger.warn(`Open documents:\n  ${openPaths}`);
+                }
+                return;
+            } catch (error) {
+                this.logger.error('Error closing document:', error as Error);
+            } finally {
+                this.isHandlingExternalUpdate = false;
+            }
+        }
+
         // Only handle incoming state if the other IDE is active
         if (!state.isActive) {
             this.logger.info('Ignoring update from inactive JetBrains IDE');
@@ -269,18 +369,6 @@ export class VSCodeJetBrainsSync {
         try {
             this.isHandlingExternalUpdate = true;
             
-            // Handle document close action
-            if (state.action === 'close') {
-                this.logger.info(`Closing document: ${state.filePath}`);
-                const documents = vscode.workspace.textDocuments;
-                const editorToClose = documents.find(editor => editor.uri.fsPath === state.filePath);
-                if (editorToClose) {
-                    await vscode.window.showTextDocument(editorToClose);
-                    await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
-                }
-                return;
-            }
-
             const uri = vscode.Uri.file(state.filePath);
             const document = await vscode.workspace.openTextDocument(uri);
             const editor = await vscode.window.showTextDocument(document, {preview: false});
@@ -305,8 +393,8 @@ export class VSCodeJetBrainsSync {
         if (this.jetbrainsClient?.readyState === WebSocket.OPEN) {
             try {
                 // Always send close events, regardless of active state
-                if (this.isActive) {
-                    this.logger.info(`Sending state update (VSCode is active'):`);
+                if (state.action === 'close' || this.isActive) {
+                    this.logger.info(`Sending state update (VSCode is ${this.isActive ? 'active' : 'inactive'}):`);
                     this.logger.debug(JSON.stringify(state));
                     this.jetbrainsClient.send(JSON.stringify(state));
                 } else {

@@ -1,6 +1,10 @@
+import org.gradle.api.tasks.compile.JavaCompile
+import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
+
 plugins {
-    id("org.jetbrains.intellij") version "1.17.2"
-    kotlin("jvm") version "1.9.22"
+    id("java")
+    id("org.jetbrains.kotlin.jvm") version "2.1.20"
+    id("org.jetbrains.intellij.platform") version "2.10.5"
     id("com.github.ben-manes.versions") version "0.51.0"
 }
 
@@ -10,13 +14,9 @@ version = file("version.properties").readLines().first().substringAfter("=").tri
 repositories {
     mavenCentral()
     maven { url = uri("https://cache-redirector.jetbrains.com/intellij-dependencies") }
-}
-
-// Configure Gradle IntelliJ Plugin
-intellij {
-    version.set("2023.3")
-    downloadSources.set(true)
-    instrumentCode.set(false) // Disable code instrumentation temporarily
+    intellijPlatform {
+        defaultRepositories()
+    }
 }
 
 dependencies {
@@ -24,6 +24,11 @@ dependencies {
     implementation("com.google.code.gson:gson:2.10.1")
     implementation("com.jetbrains.rd:rd-core:2023.3.2")
     implementation("com.jetbrains.rd:rd-framework:2023.3.2")
+
+    intellijPlatform {
+        // Target IntelliJ Platform 2025.1 (251.*) – совместимо с Android Studio Narwhal 2025.1.x
+        intellijIdeaCommunity("2025.1")
+    }
 }
 
 sourceSets {
@@ -37,17 +42,25 @@ sourceSets {
     }
 }
 
-tasks {
-    buildSearchableOptions {
-        enabled = false
-    }
-    
-    patchPluginXml {
-        version.set("${project.version}")
-        sinceBuild.set("233")
-        untilBuild.set(provider{null})
-    }
+intellijPlatform {
+    // Disable tasks we don't need
+    buildSearchableOptions = false
+    instrumentCode = false
 
+    projectName = project.name
+
+    pluginConfiguration {
+        version = project.version.toString()
+
+        ideaVersion {
+            // Android Studio Narwhal 2025.1.x is based on 251.* platform builds
+            sinceBuild = "251"
+            untilBuild = null
+        }
+    }
+}
+
+tasks {
     register("syncVersionToVSCode") {
         group = "build"
         description = "Synchronize version from version.properties to VSCode extension package.json"
@@ -83,20 +96,30 @@ tasks {
     
     prepareSandbox {
         doLast {
+            val sandboxPluginsDir = intellijPlatform.sandboxContainer
+                .get()
+                .dir("plugins/${project.name}/lib")
+                .asFile
+
             copy {
                 from("${project.projectDir}/src/main/resources")
-                into("${intellij.sandboxDir.get()}/plugins/${project.name}/lib")
+                into(sandboxPluginsDir)
                 include("**/*")
             }
         }
     }
-    
-    compileKotlin {
-        kotlinOptions {
-            jvmTarget = "17"
-            apiVersion = "1.8"
-            languageVersion = "1.8"
-            freeCompilerArgs = listOf("-Xjvm-default=all")
-        }
-    }
 } 
+
+tasks.withType<JavaCompile>().configureEach {
+    sourceCompatibility = "21"
+    targetCompatibility = "21"
+}
+
+tasks.withType<KotlinCompile>().configureEach {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21)
+        apiVersion.set(org.jetbrains.kotlin.gradle.dsl.KotlinVersion.KOTLIN_1_8)
+        languageVersion.set(org.jetbrains.kotlin.gradle.dsl.KotlinVersion.KOTLIN_1_8)
+        freeCompilerArgs.add("-Xjvm-default=all")
+    }
+}

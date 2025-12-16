@@ -28,7 +28,7 @@ data class EditorState(
     val column: Int,
     val source: String? = "jetbrains",
     val isActive: Boolean = false,
-    val action: String? = null
+    val action: String
 )
 
 @Service(Service.Level.PROJECT)
@@ -198,36 +198,47 @@ class VSCodeJetBrainsSyncService(private val project: Project) {
             FileEditorManagerListener.FILE_EDITOR_MANAGER,
             object : FileEditorManagerListener {
                 override fun fileOpened(source: FileEditorManager, file: VirtualFile) {
-                    if (!isHandlingExternalUpdate) {
-                        val editor = source.selectedTextEditor
-                        editor?.let {
-                            updateStateFromEditor(it, file)
-                            setupCaretListener(it, file)
-                        }
+                    if (isHandlingExternalUpdate) return
+
+                    source.selectedTextEditor?.let {
+                        updateStateFromEditor(it, file)
+                        setupCaretListener(it, file)
                     }
+
                 }
 
                 override fun fileClosed(source: FileEditorManager, file: VirtualFile) {
-                    if (!isHandlingExternalUpdate) {
-                        val state = EditorState(
-                            filePath = file.path,
-                            line = 0,
-                            column = 0,
-                            isActive = isActive,
-                            action = "close"
-                        )
-                        updateState(state)
+                    if (isHandlingExternalUpdate) {
+                        log.info("Skipping fileClosed event (handling external update): ${file.path}")
+                        return
                     }
+
+                    log.info("File closed in IntelliJ: ${file.path}")
+                    log.info("IsActive: $isActive, IsConnected: $isConnected")
+                    
+                    val state = EditorState(
+                        filePath = file.path,
+                        line = 0,
+                        column = 0,
+                        isActive = isActive,
+                        action = "close"
+                    )
+                    
+                    log.info("Sending close event: ${gson.toJson(state)}")
+                    updateState(state)
                 }
 
                 override fun selectionChanged(event: FileEditorManagerEvent) {
-                    if (!isHandlingExternalUpdate && event.newFile != null) {
-                        val editor = FileEditorManager.getInstance(project).selectedTextEditor
-                        editor?.let {
-                            updateStateFromEditor(it, event.newFile!!)
-                            setupCaretListener(it, event.newFile!!)
-                        }
+                    val file = event.newFile
+                    if (isHandlingExternalUpdate || file == null) {
+                        return
                     }
+
+                    FileEditorManager.getInstance(project).selectedTextEditor?.let {
+                        updateStateFromEditor(it, file)
+                        setupCaretListener(it, file)
+                    }
+
                 }
             }
         )
@@ -269,16 +280,44 @@ class VSCodeJetBrainsSyncService(private val project: Project) {
     }
 
     private fun updateStateFromEditor(editor: Editor, file: VirtualFile) {
-        val state = EditorState(
-            filePath = file.path,
-            line = editor.caretModel.logicalPosition.line,
-            column = editor.caretModel.logicalPosition.column,
-            isActive = isActive
+        updateState(
+            EditorState(
+                filePath = file.path,
+                line = editor.caretModel.logicalPosition.line,
+                column = editor.caretModel.logicalPosition.column,
+                isActive = isActive,
+                action = "select"
+            )
         )
-        updateState(state)
     }
 
     private fun handleIncomingState(state: EditorState) {
+        // Always handle close events, regardless of active state
+        if (state.action == "close") {
+            log.info("Received close event for file: ${state.filePath}")
+            isHandlingExternalUpdate = true
+            try {
+                ApplicationManager.getApplication().invokeLater {
+                    try {
+                        val file = File(state.filePath)
+                        val virtualFile = LocalFileSystem.getInstance().findFileByIoFile(file)
+                        virtualFile?.let {
+                            log.info("Closing file in JetBrains: ${it.path}")
+                            FileEditorManager.getInstance(project).closeFile(it)
+                        } ?: run {
+                            log.info("File not found: ${state.filePath}")
+                        }
+                    } catch (e: Exception) {
+                        log.info("Error closing file: ${e.message}")
+                        e.printStackTrace()
+                    }
+                }
+            } finally {
+                isHandlingExternalUpdate = false
+            }
+            return
+        }
+
         // Only handle incoming state if the other IDE is active
         if (!state.isActive) {
             log.info("Ignoring update from inactive VSCode")
@@ -289,24 +328,16 @@ class VSCodeJetBrainsSyncService(private val project: Project) {
         try {
             ApplicationManager.getApplication().invokeLater {
                 try {
-                    // Handle document close action
-                    if (state.action == "close") {
-                        val file = File(state.filePath)
-                        val virtualFile = LocalFileSystem.getInstance().findFileByIoFile(file)
-                        virtualFile?.let {
-                            FileEditorManager.getInstance(project).closeFile(it)
-                        }
-                        return@invokeLater
-                    }
-
                     val file = File(state.filePath)
                     val virtualFile = LocalFileSystem.getInstance().findFileByIoFile(file)
 
                     virtualFile?.let { it ->
                         val fileEditorManager = FileEditorManager.getInstance(project)
                         // first check if the file is already open
-                        val existingEditor = fileEditorManager.selectedEditors.firstOrNull { it.file == virtualFile } as? TextEditor
-                        val editor = existingEditor ?: fileEditorManager.openFile(it, false).firstOrNull() as? TextEditor
+                        val existingEditor =
+                            fileEditorManager.selectedEditors.firstOrNull { it.file == virtualFile } as? TextEditor
+                        val editor =
+                            existingEditor ?: fileEditorManager.openFile(it, false).firstOrNull() as? TextEditor
 
                         editor?.let { textEditor ->
                             val position = LogicalPosition(state.line, state.column)
@@ -332,27 +363,43 @@ class VSCodeJetBrainsSyncService(private val project: Project) {
     }
 
     private fun updateState(state: EditorState) {
-        if (!isHandlingExternalUpdate) {
-            webSocket?.let { client ->
-                if (client.isOpen) {
-                    // Only send updates if we're active
-                    if (isActive) {
-                        log.info("Sending state update (JetBrains is active): ${gson.toJson(state)}")
-                        client.send(gson.toJson(state))
-                    } else {
-                        log.info("Skipping state update (JetBrains is not active)")
+        if (isHandlingExternalUpdate) {
+            log.info("Skipping updateState (handling external update)")
+            return
+        }
+
+        webSocket?.let { client ->
+            if (client.isOpen) {
+                // Always send close events, regardless of active state
+                val shouldSend = state.action == "close" || isActive
+                log.info("updateState: action=${state.action}, isActive=$isActive, shouldSend=$shouldSend")
+                
+                if (shouldSend) {
+                    val jsonState = gson.toJson(state)
+                    log.info(
+                        "Sending state update (JetBrains is ${if (isActive) "active" else "inactive"}): $jsonState"
+                    )
+                    try {
+                        client.send(jsonState)
+                        log.info("State update sent successfully")
+                    } catch (e: Exception) {
+                        log.info("Error sending state update: ${e.message}")
+                        e.printStackTrace()
                     }
                 } else {
-                    log.info("WebSocket is not open. Current state: ${client.readyState}")
-                    if (!isReconnecting) {
-                        connectWebSocket()
-                    }
+                    log.info("Skipping state update (JetBrains is not active and not a close event)")
                 }
-            } ?: run {
-                log.info("WebSocket client is null, attempting to reconnect...")
-                connectWebSocket()
+            } else {
+                log.info("WebSocket is not open. Current state: ${client.readyState}")
+                if (!isReconnecting) {
+                    connectWebSocket()
+                }
             }
+        } ?: run {
+            log.info("WebSocket client is null, attempting to reconnect...")
+            connectWebSocket()
         }
+
     }
 
     fun isConnected(): Boolean = isConnected
